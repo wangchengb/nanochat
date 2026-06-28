@@ -18,7 +18,7 @@ import wandb
 import torch
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_token_bytes
-from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state
+from nanochat.checkpoint_manager import save_checkpoint, load_model, load_optimizer_state, tokenizer_dir_from_meta
 from nanochat.loss_eval import evaluate_bpb
 import torch.distributed as dist
 from nanochat.flash_attention import HAS_FA3
@@ -40,6 +40,7 @@ parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('d
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # Model loading
+parser.add_argument("--model-source", type=str, default="base", choices=["base", "sft"], help="checkpoint family to load: base or sft")
 parser.add_argument("--model-tag", type=str, default=None, help="model tag to load from")
 parser.add_argument("--model-step", type=int, default=None, help="model step to load from")
 parser.add_argument("--load-optimizer", type=int, default=1, help="warm-start optimizer from pretrained checkpoint (0=no, 1=yes)")
@@ -66,6 +67,7 @@ parser.add_argument("--chatcore-max-cat", type=int, default=-1, help="max proble
 parser.add_argument("--chatcore-max-sample", type=int, default=24, help="max problems per generative task for ChatCORE")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N optimizer steps (-1 = only at end)")
 # Data mixture
+parser.add_argument("--data-profile", type=str, default="default", choices=["default", "custom-only"], help="default NanoChat mixture or only the supplied custom JSONL")
 parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
 parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epochs of GSM8K in training mixture (teaches Math and Tool Use)")
 parser.add_argument("--custom-train-jsonl", type=str, default=None, help="additional conversation JSONL for training")
@@ -77,6 +79,10 @@ if args.custom_train_repeats < 1:
     parser.error("--custom-train-repeats must be >= 1")
 if args.custom_train_token_ratio is not None and not 0 < args.custom_train_token_ratio < 1:
     parser.error("--custom-train-token-ratio must be between 0 and 1")
+if args.data_profile == "custom-only" and args.custom_train_jsonl is None:
+    parser.error("--data-profile=custom-only requires --custom-train-jsonl")
+if args.data_profile == "custom-only" and args.custom_train_token_ratio is not None:
+    parser.error("--custom-train-token-ratio is not meaningful with --data-profile=custom-only")
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
 
@@ -103,7 +109,7 @@ if not HAS_FA3:
     print0("WARNING: Flash Attention 3 not available, using PyTorch SDPA fallback. Training will be less efficient.")
 
 # Load the model and tokenizer
-model, tokenizer, meta = load_model("base", device, phase="train", model_tag=args.model_tag, step=args.model_step)
+model, tokenizer, meta = load_model(args.model_source, device, phase="train", model_tag=args.model_tag, step=args.model_step)
 
 # Inherit training hyperparameters from pretrained checkpoint (None = inherit, explicit value = override)
 pretrain_user_config = meta.get("user_config", {})
@@ -137,7 +143,7 @@ grad_accum_steps = args.total_batch_size // world_tokens_per_fwdbwd
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {args.total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
-token_bytes = get_token_bytes(device=device)
+token_bytes = get_token_bytes(device=device, tokenizer_dir=tokenizer_dir_from_meta(meta))
 
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
 # Note that pretraining ramps weight_decay to zero by end of pretraining, so SFT continues with zero
@@ -149,7 +155,7 @@ optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_
 # restore our fresh SFT LRs after loading.
 base_dir = get_base_dir()
 if args.load_optimizer:
-    optimizer_data = load_optimizer_state("base", device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
+    optimizer_data = load_optimizer_state(args.model_source, device, rank=ddp_rank, model_tag=args.model_tag, step=args.model_step)
     if optimizer_data is not None:
         base_lrs = [group["lr"] for group in optimizer.param_groups]
         optimizer.load_state_dict(optimizer_data)
@@ -172,15 +178,18 @@ for group in optimizer.param_groups:
 
 # SFT data mixture and DataLoader
 identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
-train_tasks = [
-    SmolTalk(split="train"), # 460K rows of general conversations
-    CustomJSON(filepath=identity_conversations_filepath), # 1000 rows of synthetic identity conversations
-    CustomJSON(filepath=identity_conversations_filepath), # 2 epochs of these
-    *[MMLU(subset="all", split="auxiliary_train") for _ in range(args.mmlu_epochs)], # 100K rows per epoch
-    *[GSM8K(subset="main", split="train") for _ in range(args.gsm8k_epochs)], # 8K rows per epoch
-    SimpleSpelling(size=200000, split="train"), # 200K rows of Simple Spelling (e.g. spell the word 'apple')
-    SpellingBee(size=80000, split="train"), # 80K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
-]
+if args.data_profile == "default":
+    train_tasks = [
+        SmolTalk(split="train"), # 460K rows of general conversations
+        CustomJSON(filepath=identity_conversations_filepath), # 1000 rows of synthetic identity conversations
+        CustomJSON(filepath=identity_conversations_filepath), # 2 epochs of these
+        *[MMLU(subset="all", split="auxiliary_train") for _ in range(args.mmlu_epochs)], # 100K rows per epoch
+        *[GSM8K(subset="main", split="train") for _ in range(args.gsm8k_epochs)], # 8K rows per epoch
+        SimpleSpelling(size=200000, split="train"), # 200K rows of Simple Spelling (e.g. spell the word 'apple')
+        SpellingBee(size=80000, split="train"), # 80K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
+    ]
+else:
+    train_tasks = []
 custom_effective_rows = 0
 estimated_custom_token_ratio = None
 if args.custom_train_jsonl is not None:
@@ -191,7 +200,11 @@ if args.custom_train_jsonl is not None:
     if len(custom_task) == 0:
         raise ValueError(f"Custom train JSONL contains no conversations: {custom_train_path}")
 
-    if args.custom_train_token_ratio is None:
+    if args.data_profile == "custom-only":
+        train_tasks.extend([custom_task] * args.custom_train_repeats)
+        custom_effective_rows = len(custom_task) * args.custom_train_repeats
+        estimated_custom_token_ratio = 1.0
+    elif args.custom_train_token_ratio is None:
         train_tasks.extend([custom_task] * args.custom_train_repeats)
         custom_effective_rows = len(custom_task) * args.custom_train_repeats
     else:
@@ -221,22 +234,32 @@ if args.custom_train_jsonl is not None:
             / (base_token_mass + custom_effective_rows * custom_average_tokens)
         )
 train_dataset = TaskMixture(train_tasks)
+mixture_details = (
+    f"MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs}, "
+    if args.data_profile == "default"
+    else "built-in tasks disabled, "
+)
 print0(
-    f"Training mixture: {len(train_dataset):,} rows "
-    f"(MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs}, "
+    f"Training mixture ({args.data_profile}): {len(train_dataset):,} rows "
+    f"({mixture_details}"
     f"custom rows {custom_effective_rows:,}, "
     f"estimated custom token ratio {estimated_custom_token_ratio})"
 )
-val_tasks = [
-    SmolTalk(split="test"), # 24K rows in test set
-    MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
-    GSM8K(subset="main", split="test", stop=420), # 1.32K rows in test set, use only 420 to match the train ratios
-] # total: 24K + 5.2K + 0.42K ~= 29.6K rows
+if args.data_profile == "default":
+    val_tasks = [
+        SmolTalk(split="test"), # 24K rows in test set
+        MMLU(subset="all", split="test", stop=5200), # 14K rows in test set, use only 5.2K to match the train ratios
+        GSM8K(subset="main", split="test", stop=420), # 1.32K rows in test set, use only 420 to match the train ratios
+    ] # total: 24K + 5.2K + 0.42K ~= 29.6K rows
+else:
+    val_tasks = []
 if args.custom_val_jsonl is not None:
     custom_val_path = os.path.abspath(os.path.expanduser(args.custom_val_jsonl))
     if not os.path.exists(custom_val_path):
         raise FileNotFoundError(f"Custom val JSONL not found: {custom_val_path}")
     val_tasks.append(CustomJSON(filepath=custom_val_path))
+if not val_tasks:
+    raise ValueError("Validation mixture is empty; provide --custom-val-jsonl")
 val_dataset = TaskMixture(val_tasks)
 # DataLoader is defined here, it emits inputs, targets : 2D tensors of shape (device_batch_size, max_seq_len)
 # A big problem is that we don't know the final num_iterations in advance. So we create
@@ -331,8 +354,9 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
             current_epoch = epoch
             if args.num_iterations <= 0:
                 approx_progress = consumed / dataset_size
-            # Trigger last_step when we've consumed enough (instead of when cursor wraps)
-            if consumed >= dataset_size:
+            # Dataset-driven runs stop after one epoch. Fixed-step runs are
+            # allowed to cycle over smaller datasets until num_iterations.
+            if args.num_iterations <= 0 and consumed >= dataset_size:
                 last_step = True
 
         # Build tensors
@@ -480,6 +504,7 @@ while True:
                     "window_pattern": model.config.window_pattern,
                 },
                 "user_config": user_config, # inputs to the training script
+                "tokenizer": meta.get("tokenizer"),
             },
             rank=ddp_rank,
         )
