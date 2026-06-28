@@ -102,6 +102,48 @@ def summarize(records):
     }
 
 
+def evaluate_language_responses(
+    model,
+    tokenizer,
+    max_new_tokens=128,
+    temperature=0.0,
+    top_k=50,
+    seed=42,
+    progress_callback=None,
+):
+    """Run the fixed bilingual prompt set and return records plus summary."""
+    engine = Engine(model, tokenizer)
+    prompts = build_prompts()
+    records = []
+    for index, item in enumerate(prompts, 1):
+        prompt_tokens = render_prompt(tokenizer, item["prompt"])
+        results, _ = engine.generate_batch(
+            prompt_tokens,
+            num_samples=1,
+            max_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            seed=seed,
+        )
+        response_decoder = IncrementalTextDecoder(tokenizer)
+        response = "".join(
+            response_decoder.push(token_id)
+            for token_id in results[0][len(prompt_tokens):]
+        )
+        record = {
+            **item,
+            "response": response,
+            "metrics": response_metrics(response),
+        }
+        records.append(record)
+        if progress_callback is not None:
+            progress_callback(index, len(prompts), record)
+    return {
+        "summary": summarize(records),
+        "records": records,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Chinese/English response language")
     parser.add_argument("-i", "--source", choices=["base", "sft", "rl"], default="sft")
@@ -117,43 +159,23 @@ def main():
     model, tokenizer, meta = load_model(
         args.source, device, phase="eval", model_tag=args.model_tag, step=args.step,
     )
-    engine = Engine(model, tokenizer)
 
-    prompts = build_prompts()
-    records = []
-    for index, item in enumerate(prompts, 1):
-        prompt_tokens = render_prompt(tokenizer, item["prompt"])
-        results, _ = engine.generate_batch(
-            prompt_tokens,
-            num_samples=1,
-            max_tokens=args.max_new_tokens,
-            temperature=0.0,
-            top_k=50,
-            seed=42,
-        )
-        response_decoder = IncrementalTextDecoder(tokenizer)
-        response = "".join(
-            response_decoder.push(token_id)
-            for token_id in results[0][len(prompt_tokens):]
-        )
-        record = {
-            **item,
-            "response": response,
-            "metrics": response_metrics(response),
-        }
-        records.append(record)
-        print0(
-            f"[{index:03d}/{len(prompts)}] {item['language']} "
-            f"cjk={record['metrics']['cjk_ratio']:.2f} {response[:80]!r}"
-        )
-
+    language_report = evaluate_language_responses(
+        model,
+        tokenizer,
+        max_new_tokens=args.max_new_tokens,
+        progress_callback=lambda index, total, record: print0(
+            f"[{index:03d}/{total}] {record['language']} "
+            f"cjk={record['metrics']['cjk_ratio']:.2f} "
+            f"{record['response'][:80]!r}"
+        ),
+    )
     report = {
         "source": args.source,
         "model_tag": args.model_tag,
         "requested_step": args.step,
         "loaded_step": meta["step"],
-        "summary": summarize(records),
-        "records": records,
+        **language_report,
     }
     output_path = args.output
     if output_path is None:

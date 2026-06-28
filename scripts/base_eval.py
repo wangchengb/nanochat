@@ -20,6 +20,7 @@ Examples:
     python -m scripts.base_eval --model-tag d24 --device-batch-size=16 --max-per-task=100 --split-tokens=524288
 """
 import os
+import gc
 import csv
 import time
 import json
@@ -33,7 +34,7 @@ import torch
 
 from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
 from nanochat.tokenizer import HuggingFaceTokenizer, get_token_bytes
-from nanochat.checkpoint_manager import load_model
+from nanochat.checkpoint_manager import load_model, tokenizer_dir_from_meta
 from nanochat.core_eval import evaluate_task
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
 from nanochat.loss_eval import evaluate_bpb
@@ -104,7 +105,23 @@ def place_eval_bundle(file_path):
     print0(f"Placed eval_bundle directory at {eval_bundle_dir}")
 
 
-def evaluate_core(model, tokenizer, device, max_per_task=-1):
+def clear_eval_cache(device):
+    gc.collect()
+    if device.type == "mps":
+        torch.mps.empty_cache()
+    elif device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
+def evaluate_core(
+    model,
+    tokenizer,
+    device,
+    max_per_task=-1,
+    initial_payload=None,
+    progress_callback=None,
+    task_labels=None,
+):
     """
     Evaluate a base model on the CORE benchmark.
     Returns dict with results, centered_results, and core_metric.
@@ -122,6 +139,13 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
     with open(config_path, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
     tasks = config['icl_tasks']
+    if task_labels:
+        requested_labels = set(task_labels)
+        known_labels = {task["label"] for task in tasks}
+        unknown_labels = requested_labels - known_labels
+        if unknown_labels:
+            raise ValueError(f"Unknown CORE tasks: {sorted(unknown_labels)}")
+        tasks = [task for task in tasks if task["label"] in requested_labels]
 
     # Load random baseline values
     random_baselines = {}
@@ -133,11 +157,18 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
             random_baselines[task_name] = float(random_baseline)
 
     # Evaluate each task
-    results = {}
-    centered_results = {}
+    payload = initial_payload or {
+        "results": {},
+        "centered_results": {},
+        "core_metric": None,
+    }
+    results = payload["results"]
+    centered_results = payload["centered_results"]
     for task in tasks:
         start_time = time.time()
         label = task['label']
+        if label in results and label in centered_results:
+            continue
         task_meta = {
             'task_type': task['icl_task_type'],
             'dataset_uri': task['dataset_uri'],
@@ -156,21 +187,22 @@ def evaluate_core(model, tokenizer, device, max_per_task=-1):
         if max_per_task > 0:
             data = data[:max_per_task]
 
+        clear_eval_cache(device)
         accuracy = evaluate_task(model, tokenizer, data, device, task_meta)
         results[label] = accuracy
         random_baseline = random_baselines[label]
         centered_result = (accuracy - 0.01 * random_baseline) / (1.0 - 0.01 * random_baseline)
         centered_results[label] = centered_result
+        payload["core_metric"] = None
+        if progress_callback is not None:
+            progress_callback(payload)
+        clear_eval_cache(device)
         elapsed = time.time() - start_time
         print0(f"accuracy: {accuracy:.4f} | centered: {centered_result:.4f} | time: {elapsed:.2f}s")
 
     core_metric = sum(centered_results.values()) / len(centered_results)
-    out = {
-        "results": results,
-        "centered_results": centered_results,
-        "core_metric": core_metric
-    }
-    return out
+    payload["core_metric"] = core_metric
+    return payload
 
 # -----------------------------------------------------------------------------
 # Main
@@ -209,7 +241,10 @@ def main():
     else:
         model, tokenizer, meta = load_model("base", device, phase="eval", model_tag=args.model_tag, step=args.step)
         sequence_len = meta["model_config"]["sequence_len"]
-        token_bytes = get_token_bytes(device=device)
+        token_bytes = get_token_bytes(
+            device=device,
+            tokenizer_dir=tokenizer_dir_from_meta(meta),
+        )
         model_name = f"base_model (step {meta['step']})"
         model_slug = f"base_model_{meta['step']:06d}"
 

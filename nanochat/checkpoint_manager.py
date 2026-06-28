@@ -10,7 +10,7 @@ import torch
 
 from nanochat.common import get_base_dir
 from nanochat.gpt import GPT, GPTConfig
-from nanochat.tokenizer import get_tokenizer
+from nanochat.tokenizer import get_tokenizer, resolve_tokenizer_dir
 from nanochat.common import setup_default_logging
 
 # Set up logging
@@ -109,10 +109,28 @@ def build_model(checkpoint_dir, step, device, phase):
     else:
         model.train()
     # Load the Tokenizer
-    tokenizer = get_tokenizer()
+    tokenizer_meta = meta_data.get("tokenizer") or {}
+    tokenizer_tag = tokenizer_meta.get("tag")
+    tokenizer_dir = tokenizer_meta.get("directory")
+    if tokenizer_tag is not None:
+        tokenizer = get_tokenizer(tokenizer_tag=tokenizer_tag)
+    elif tokenizer_dir is not None:
+        tokenizer = get_tokenizer(tokenizer_dir=tokenizer_dir)
+    else:
+        tokenizer = get_tokenizer()
     # Sanity check: compatibility between model and tokenizer
     assert tokenizer.get_vocab_size() == model_config_kwargs["vocab_size"], f"Tokenizer vocab size {tokenizer.get_vocab_size()} does not match model config vocab size {model_config_kwargs['vocab_size']}"
     return model, tokenizer, meta_data
+
+def tokenizer_dir_from_meta(meta_data):
+    tokenizer_meta = meta_data.get("tokenizer") or {}
+    return resolve_tokenizer_dir(
+        tokenizer_tag=tokenizer_meta.get("tag"),
+        tokenizer_dir=(
+            None if tokenizer_meta.get("tag") is not None
+            else tokenizer_meta.get("directory")
+        ),
+    )
 
 
 def find_largest_model(checkpoints_dir):

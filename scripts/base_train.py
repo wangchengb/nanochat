@@ -18,6 +18,7 @@ import json
 import time
 import math
 import argparse
+import sys
 from dataclasses import asdict
 from contextlib import contextmanager
 
@@ -28,10 +29,16 @@ import torch.distributed as dist
 from nanochat.gpt import GPT, GPTConfig, Linear
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
-from nanochat.tokenizer import get_tokenizer, get_token_bytes
+from nanochat.tokenizer import get_tokenizer, get_token_bytes, resolve_tokenizer_dir
 from nanochat.checkpoint_manager import save_checkpoint, load_checkpoint, find_last_step
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
+from nanochat.experiment import (
+    atomic_write_json,
+    build_training_manifest,
+    checkpoint_source_metadata,
+    ensure_fresh_checkpoint_dir,
+)
 from nanochat.flash_attention import HAS_FA3
 from scripts.base_eval import evaluate_core
 print_banner()
@@ -43,6 +50,8 @@ parser = argparse.ArgumentParser(description="Pretrain base model")
 parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
+parser.add_argument("--dry-run", action="store_true", help="load weights/data and run one optimizer step without saving")
+parser.add_argument("--no-compile", action="store_true", help="disable torch.compile (useful for CPU dry-runs)")
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
@@ -76,10 +85,12 @@ parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number o
 parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
-parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--save-every", type=int, default=1000, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 parser.add_argument("--data-dir", type=str, default=None, help="directory containing train parquet shards followed by one validation shard")
+parser.add_argument("--tokenizer-tag", type=str, default=None, help="tokenizer under $NANOCHAT_BASE_DIR/tokenizers/<tag>")
+parser.add_argument("--tokenizer-dir", type=str, default=None, help="explicit tokenizer directory")
 args = parser.parse_args()
 user_config = vars(args).copy()  # for logging
 if args.resume_from_step != -1 and args.init_from_model_tag is not None:
@@ -127,8 +138,14 @@ else:
 
 # -----------------------------------------------------------------------------
 # Tokenizer will be useful for evaluation and also we need the vocab size to init the model
-tokenizer = get_tokenizer()
-token_bytes = get_token_bytes(device=device)
+if args.tokenizer_tag is not None and args.tokenizer_dir is not None:
+    parser.error("Specify only one of --tokenizer-tag or --tokenizer-dir")
+tokenizer_dir = resolve_tokenizer_dir(
+    tokenizer_tag=args.tokenizer_tag,
+    tokenizer_dir=args.tokenizer_dir,
+)
+tokenizer = get_tokenizer(tokenizer_dir=tokenizer_dir)
+token_bytes = get_token_bytes(device=device, tokenizer_dir=tokenizer_dir)
 vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
 
@@ -164,6 +181,8 @@ base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
+ensure_fresh_checkpoint_dir(checkpoint_dir, resuming=resuming, dry_run=args.dry_run)
+source_checkpoint = None
 if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
@@ -172,6 +191,11 @@ if resuming:
 elif args.init_from_model_tag is not None:
     source_dir = os.path.join(base_dir, "base_checkpoints", args.init_from_model_tag)
     source_step = args.init_from_step if args.init_from_step is not None else find_last_step(source_dir)
+    source_checkpoint = (
+        checkpoint_source_metadata(source_dir, source_step)
+        if master_process
+        else {"directory": source_dir, "step": source_step}
+    )
     print0(f"Initializing model weights from {args.init_from_model_tag} step {source_step}")
     model_data, _, init_meta_data = load_checkpoint(source_dir, source_step, device, load_optimizer=False)
     source_config = dict(init_meta_data["model_config"])
@@ -268,7 +292,10 @@ def disable_fp8(model):
 # Compile the model
 
 orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+if args.no_compile:
+    print0("torch.compile disabled")
+else:
+    model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
 
 # -----------------------------------------------------------------------------
 # Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
@@ -443,6 +470,67 @@ print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_l
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
+# Write a reproducibility manifest only for real runs. A dry-run is deliberately
+# side-effect free with respect to the checkpoint directory.
+if master_process and not args.dry_run:
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    data_dir = args.data_dir or os.path.join(base_dir, "base_data_climbmix")
+    manifest = build_training_manifest(
+        repo_root=repo_root,
+        command=[sys.executable, "-m", "scripts.base_train", *sys.argv[1:]],
+        user_config=user_config,
+        resolved_config={
+            "device_type": device_type,
+            "ddp_world_size": ddp_world_size,
+            "model_config": model_config_kwargs,
+            "num_iterations": num_iterations,
+            "total_batch_size": total_batch_size,
+            "total_tokens": total_tokens,
+            "num_flops_per_token": num_flops_per_token,
+            "estimated_total_flops": num_flops_per_token * total_tokens,
+            "batch_lr_scale": batch_lr_scale,
+            "weight_decay": weight_decay_scaled,
+            "fresh_optimizer": not resuming,
+            "fresh_dataloader_state": not resuming,
+            "initial_step": args.resume_from_step if resuming else 0,
+            "compiled": not args.no_compile,
+        },
+        output={
+            "model_tag": output_dirname,
+            "checkpoint_dir": checkpoint_dir,
+        },
+        source_checkpoint=source_checkpoint,
+        tokenizer_dir=tokenizer_dir,
+        data_dir=data_dir,
+    )
+    atomic_write_json(os.path.join(checkpoint_dir, "manifest.json"), manifest)
+    print0(f"Training manifest: {os.path.join(checkpoint_dir, 'manifest.json')}")
+
+# Dry-run validates checkpoint compatibility, tokenizer, data loading, gradient
+# accumulation, and optimizer state without creating any training artifacts.
+if args.dry_run:
+    model.train()
+    for _ in range(grad_accum_steps):
+        loss = model(x, y) / grad_accum_steps
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+        x, y, dataloader_state_dict = next(train_loader)
+    if scaler is not None:
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
+    model.zero_grad(set_to_none=True)
+    print0(
+        "Dry-run completed: source weights, fresh optimizer, data loader, "
+        "forward/backward, and one optimizer step are valid. No checkpoint was written."
+    )
+    wandb_run.finish()
+    compute_cleanup()
+    raise SystemExit(0)
+
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
@@ -516,6 +604,12 @@ while True:
                 "val_bpb": val_bpb, # loss at last step
                 "model_config": model_config_kwargs,
                 "user_config": user_config, # inputs to the training script
+                "training_manifest": os.path.join(checkpoint_dir, "manifest.json"),
+                "source_checkpoint": source_checkpoint,
+                "tokenizer": {
+                    "tag": args.tokenizer_tag,
+                    "directory": tokenizer_dir,
+                },
                 "device_batch_size": args.device_batch_size,
                 "max_seq_len": args.max_seq_len,
                 "total_batch_size": total_batch_size,

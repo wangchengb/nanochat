@@ -1,13 +1,31 @@
 import pyarrow as pa
 import pyarrow.parquet as pq
+import os
+import regex
 
 from nanochat.dataloader import _document_batches
-from nanochat.tokenizer import IncrementalTextDecoder
+from nanochat.tokenizer import (
+    IncrementalTextDecoder,
+    get_split_pattern,
+    resolve_tokenizer_dir,
+)
 from scripts.prepare_zh_experiment_data import cjk_language_ratio, normalize_messages
+from scripts.prepare_bilingual_pretrain_data import chunk_document
 from scripts.zh_eval import response_metrics, summarize
 
 
 class ByteTokenizer:
+    enc = None
+
+    def __init__(self):
+        self.enc = self
+
+    def encode(self, text):
+        return list(text.encode("utf-8"))
+
+    def decode_bytes(self, token_ids):
+        return bytes(token_ids)
+
     def decode(self, token_ids):
         return bytes(token_ids).decode("utf-8", errors="replace")
 
@@ -82,3 +100,66 @@ def test_custom_data_dir_requires_train_and_validation_shards(tmp_path):
         assert "Custom data directory" in str(error)
     else:
         raise AssertionError("Expected a custom data directory with one shard to be rejected")
+
+
+def test_tagged_tokenizer_directory_is_isolated(tmp_path):
+    original = os.environ.get("NANOCHAT_BASE_DIR")
+    os.environ["NANOCHAT_BASE_DIR"] = str(tmp_path)
+    try:
+        assert resolve_tokenizer_dir() == str(tmp_path / "tokenizer")
+        assert resolve_tokenizer_dir(tokenizer_tag="bilingual-32k-v1") == str(
+            tmp_path / "tokenizers" / "bilingual-32k-v1"
+        )
+    finally:
+        if original is None:
+            os.environ.pop("NANOCHAT_BASE_DIR", None)
+        else:
+            os.environ["NANOCHAT_BASE_DIR"] = original
+
+
+def test_bilingual_split_pattern_bounds_han_and_separates_latin():
+    text = "机器学习让计算机处理数据。Hello world! 中英文mixed测试。"
+    pieces = regex.findall(
+        get_split_pattern("bilingual-han4"),
+        text,
+        flags=regex.VERSION1,
+    )
+    han_pieces = [
+        piece for piece in pieces
+        if any(0x3400 <= ord(char) <= 0x9FFF for char in piece)
+    ]
+    assert all(
+        sum(0x3400 <= ord(char) <= 0x9FFF for char in piece) <= 4
+        for piece in han_pieces
+    )
+    assert "mixed" in pieces
+    assert get_split_pattern("default") != get_split_pattern("bilingual-han4")
+
+
+def test_han1_split_pattern_separates_each_chinese_character():
+    pieces = regex.findall(
+        get_split_pattern("bilingual-han1"),
+        "机器学习 English",
+        flags=regex.VERSION1,
+    )
+    assert pieces[:4] == ["机", "器", "学", "习"]
+    assert pieces[-1] == " English"
+
+
+def test_pretrain_chunking_preserves_utf8_and_token_limit():
+    tokenizer = ByteTokenizer()
+    text = "中文English混合文本" * 50
+    chunks = list(
+        chunk_document(
+            tokenizer,
+            text,
+            max_chunk_tokens=31,
+            min_chunk_tokens=1,
+        )
+    )
+    assert "".join(chunk["text"] for chunk in chunks) == text
+    assert all(chunk["content_tokens"] <= 31 for chunk in chunks)
+    assert all(
+        chunk["training_tokens"] == chunk["content_tokens"] + 1
+        for chunk in chunks
+    )
