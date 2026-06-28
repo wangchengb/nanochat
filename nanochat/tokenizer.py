@@ -47,6 +47,40 @@ class IncrementalTextDecoder:
 # I verified that 2 is the sweet spot for vocab size of 32K. 1 is a bit worse, 3 was worse still.
 SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 
+
+def bilingual_split_pattern(max_han_chars):
+    """Bound Han spans while preserving the original behavior for other scripts."""
+    if max_han_chars not in {1, 2, 4, 8}:
+        raise ValueError(f"Unsupported Han chunk size: {max_han_chars}")
+    return (
+        r"'(?i:[sdmt]|ll|ve|re)"
+        r"|[^\r\n\p{L}\p{N}]?+[\p{L}&&\P{Han}]+"
+        rf"|\p{{Han}}{{1,{max_han_chars}}}"
+        r"|\p{N}{1,2}"
+        r"| ?[^\s\p{L}\p{N}]++[\r\n]*"
+        r"|\s*[\r\n]"
+        r"|\s+(?!\S)"
+        r"|\s+"
+    )
+
+
+SPLIT_PATTERN_PROFILES = {
+    "default": SPLIT_PATTERN,
+    "bilingual-han1": bilingual_split_pattern(1),
+    "bilingual-han2": bilingual_split_pattern(2),
+    "bilingual-han4": bilingual_split_pattern(4),
+    "bilingual-han8": bilingual_split_pattern(8),
+}
+
+
+def get_split_pattern(profile):
+    try:
+        return SPLIT_PATTERN_PROFILES[profile]
+    except KeyError as exc:
+        choices = ", ".join(sorted(SPLIT_PATTERN_PROFILES))
+        raise ValueError(f"Unknown split pattern profile {profile!r}; choose from {choices}") from exc
+
+
 # -----------------------------------------------------------------------------
 # Generic GPT-4-style tokenizer based on HuggingFace Tokenizer
 from tokenizers import Tokenizer as HFTokenizer
@@ -186,13 +220,17 @@ class RustBPETokenizer:
         self.bos_token_id = self.encode_special(bos_token)
 
     @classmethod
-    def train_from_iterator(cls, text_iterator, vocab_size):
+    def train_from_iterator(cls, text_iterator, vocab_size, split_pattern=SPLIT_PATTERN):
         # 1) train using rustbpe
         tokenizer = rustbpe.Tokenizer()
         # the special tokens are inserted later in __init__, we don't train them here
         vocab_size_no_special = vocab_size - len(SPECIAL_TOKENS)
         assert vocab_size_no_special >= 256, f"vocab_size_no_special must be at least 256, got {vocab_size_no_special}"
-        tokenizer.train_from_iterator(text_iterator, vocab_size_no_special, pattern=SPLIT_PATTERN)
+        tokenizer.train_from_iterator(
+            text_iterator,
+            vocab_size_no_special,
+            pattern=split_pattern,
+        )
         # 2) construct the associated tiktoken encoding for inference
         pattern = tokenizer.get_pattern()
         mergeable_ranks_list = tokenizer.get_mergeable_ranks()
@@ -405,18 +443,31 @@ class RustBPETokenizer:
 # -----------------------------------------------------------------------------
 # nanochat-specific convenience functions
 
-def get_tokenizer():
+def resolve_tokenizer_dir(tokenizer_tag=None, tokenizer_dir=None):
     from nanochat.common import get_base_dir
+    if tokenizer_tag is not None and tokenizer_dir is not None:
+        raise ValueError("Specify only one of tokenizer_tag or tokenizer_dir")
+    if tokenizer_dir is not None:
+        return os.path.abspath(os.path.expanduser(tokenizer_dir))
     base_dir = get_base_dir()
-    tokenizer_dir = os.path.join(base_dir, "tokenizer")
+    if tokenizer_tag is not None:
+        return os.path.join(base_dir, "tokenizers", tokenizer_tag)
+    return os.path.join(base_dir, "tokenizer")
+
+def get_tokenizer(tokenizer_tag=None, tokenizer_dir=None):
+    tokenizer_dir = resolve_tokenizer_dir(
+        tokenizer_tag=tokenizer_tag,
+        tokenizer_dir=tokenizer_dir,
+    )
     # return HuggingFaceTokenizer.from_directory(tokenizer_dir)
     return RustBPETokenizer.from_directory(tokenizer_dir)
 
-def get_token_bytes(device="cpu"):
+def get_token_bytes(device="cpu", tokenizer_tag=None, tokenizer_dir=None):
     import torch
-    from nanochat.common import get_base_dir
-    base_dir = get_base_dir()
-    tokenizer_dir = os.path.join(base_dir, "tokenizer")
+    tokenizer_dir = resolve_tokenizer_dir(
+        tokenizer_tag=tokenizer_tag,
+        tokenizer_dir=tokenizer_dir,
+    )
     token_bytes_path = os.path.join(tokenizer_dir, "token_bytes.pt")
     assert os.path.exists(token_bytes_path), f"Token bytes not found at {token_bytes_path}? It gets written by tok_train.py"
     with open(token_bytes_path, "rb") as f:
